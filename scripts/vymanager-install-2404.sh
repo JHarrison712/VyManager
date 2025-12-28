@@ -4,14 +4,18 @@
 # Description  : Interactive installer for vymanager on Ubuntu 24.04 LTS.
 # Author       : John Harrison
 # Created      : 2025-12-15
-# Version      : 1.0.0
+# Version      : 1.0.4
 # License      : MIT
 #
 # Project      : ExileSolutionsCloud
 # Repository   : https://github.com/jharrison712/exilesolutionscloud
 #
 # Changelog:
-#   [2025-11-11] v1.0.0 — First stable release (full rewrite).
+#   [2025-12-28] v1.0.4 — Fixed Prisma DATABASE_URL failure by switching secret generation to URL-safe hexadecimal encoding.
+#	  [2025-12-28] v1.0.3 — Fixed frontend build failure by ensuring BETTER_AUTH_SECRET is available before Next.js production build.
+#	  [2025-12-28] v1.0.2 — Fixed PostgreSQL non-interactive auth issue on Ubuntu 24.04. Thanks to Mydsilversen for identifying this issue (#89).
+#	  [2025-12-28] v1.0.1 — Fixed changelog v1.0.0 with the correct date.
+#   [2025-12-15] v1.0.0 — First stable release (full rewrite).
 ################################################################################
 set -euo pipefail
 
@@ -33,7 +37,7 @@ require_root() {
 }
 
 gen_secret() {
-  openssl rand -base64 48 | tr -d '\n'
+  openssl rand -hex 32
 }
 
 detect_ip() {
@@ -135,29 +139,40 @@ if ! id "${SERVICE_USER}" &>/dev/null; then
 fi
 
 ###############################################################################
-# POSTGRESQL (PRISMA-SAFE FIX)
+# POSTGRESQL (PRISMA + SIGNUP SAFE)
 ###############################################################################
 log_step "Configuring PostgreSQL (deterministic + Prisma-safe)"
+
 systemctl enable --now postgresql
 
-PG_HBA="/etc/postgresql/$(ls /etc/postgresql)/main/pg_hba.conf"
-sed -i 's/peer/scram-sha-256/g' "$PG_HBA"
-systemctl reload postgresql
-
 sudo -u postgres psql <<SQL
-DROP DATABASE IF EXISTS ${DB_NAME};
-DROP ROLE IF EXISTS ${DB_USER};
+
 CREATE ROLE ${DB_USER} LOGIN PASSWORD '${DB_PASS}';
 CREATE DATABASE ${DB_NAME} OWNER ${DB_USER};
 GRANT ALL PRIVILEGES ON DATABASE ${DB_NAME} TO ${DB_USER};
+
+\c ${DB_NAME}
+
+GRANT ALL ON SCHEMA public TO ${DB_USER};
+ALTER DEFAULT PRIVILEGES IN SCHEMA public
+  GRANT ALL ON TABLES TO ${DB_USER};
+ALTER DEFAULT PRIVILEGES IN SCHEMA public
+  GRANT ALL ON SEQUENCES TO ${DB_USER};
 SQL
 
-psql "${DATABASE_URL}" -c '\q' || {
-  log_error "PostgreSQL authentication failed"
-  exit 1
-}
+PGPASSWORD="${DB_PASS}" psql \
+  -h 127.0.0.1 \
+  -p 5432 \
+  -U "${DB_USER}" \
+  -d "${DB_NAME}" \
+  -c '\q'
 
-log_success "PostgreSQL ready"
+PG_VERSION="$(ls /etc/postgresql)"
+PG_HBA="/etc/postgresql/${PG_VERSION}/main/pg_hba.conf"
+sed -i 's/peer/scram-sha-256/g' "$PG_HBA"
+systemctl reload postgresql
+
+log_success "PostgreSQL ready (schema privileges fixed)"
 
 ###############################################################################
 # CLONE VYMANAGER
@@ -194,9 +209,6 @@ sudo -u "${SERVICE_USER}" sed -i \
 log_step "Setting up frontend"
 cd "${INSTALL_DIR}/frontend"
 
-sudo -u "${SERVICE_USER}" env HOME="${SERVICE_HOME}" npm install
-sudo -u "${SERVICE_USER}" env HOME="${SERVICE_HOME}" npm run build
-
 sudo -u "${SERVICE_USER}" cat > .env <<EOF
 NODE_ENV=production
 VYMANAGER_ENV=production
@@ -207,6 +219,9 @@ NEXT_PUBLIC_API_URL=http://localhost:8000
 DATABASE_URL=${DATABASE_URL}
 TRUSTED_ORIGINS=http://${SERVER_IP}:3000,http://localhost:3000
 EOF
+
+sudo -u "${SERVICE_USER}" env HOME="${SERVICE_HOME}" npm install
+sudo -u "${SERVICE_USER}" env HOME="${SERVICE_HOME}" npm run build
 
 ###############################################################################
 # PRISMA MIGRATIONS
@@ -277,4 +292,3 @@ echo "Frontend : http://${SERVER_IP}:3000"
 echo "Backend  : http://${SERVER_IP}:8000"
 echo "Docs     : http://${SERVER_IP}:8000/docs"
 echo
-
